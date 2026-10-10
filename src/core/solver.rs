@@ -5,6 +5,11 @@ use crate::error::{ChaserError, ChaserResult};
 use crate::models::{Cookie, ProxyConfig, WafSession, WafSessionOptions};
 
 use chaser_oxide::auth::Credentials;
+use chaser_oxide::cdp::browser_protocol::network::{
+    EventResponseReceived, Headers, LoaderId, ResourceType,
+};
+use chaser_oxide::cdp::browser_protocol::page::GetFrameTreeParams;
+use futures::{FutureExt, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -23,12 +28,21 @@ pub async fn get_source(
 
     setup_proxy_auth(&page, proxy.as_ref()).await?;
 
+    let (main_frame, mut responses) = watch_document_responses(&page).await?;
+
     chaser
         .goto(url)
         .await
         .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-    wait_for_clearance(&page, &chaser, 30).await;
+    let _outcome = wait_for_access(
+        &page,
+        &chaser,
+        &main_frame,
+        &mut responses,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     page.content()
         .await
@@ -63,12 +77,26 @@ pub async fn solve_waf_session(
 
         setup_proxy_auth(&page, proxy.as_ref()).await?;
 
+        let (main_frame, mut responses) = watch_document_responses(&page).await?;
+
         chaser
             .goto(url)
             .await
             .map_err(|e| ChaserError::NavigationFailed(e.to_string()))?;
 
-        wait_for_clearance(&page, &chaser, 90).await;
+        let outcome = wait_for_access(
+            &page,
+            &chaser,
+            &main_frame,
+            &mut responses,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+        .map_err(|error| match error {
+            ChaserError::Timeout(_) => timeout_error(),
+            other => other,
+        })?;
+        tracing::debug!(?outcome, "WAF access confirmed");
 
         let raw_cookies = page
             .get_cookies()
@@ -232,54 +260,170 @@ async fn setup_proxy_auth(
     Ok(())
 }
 
-/// Poll until `cf_clearance` appears (meaning the challenge was solved) or the
-/// timeout expires.
-///
-/// For the first `PASSIVE_WAIT_MS` milliseconds we do nothing — the CF managed
-/// challenge JS runs its invisible PoW/fingerprint in this window. Polling the
-/// DOM while it runs causes timing anomalies that raise the bot score. After
-/// the passive window we check whether a Turnstile widget has appeared and, if
-/// so, click it using the shadow-root CDP traversal.
-async fn wait_for_clearance(
+/// Subscribe before navigation so even a fast direct response is observed.
+async fn watch_document_responses(
+    page: &chaser_oxide::Page,
+) -> ChaserResult<(
+    chaser_oxide::cdp::browser_protocol::page::FrameId,
+    chaser_oxide::listeners::EventStream<EventResponseReceived>,
+)> {
+    let frame = page
+        .execute(GetFrameTreeParams::default())
+        .await
+        .map_err(|e| ChaserError::Internal(format!("get main frame: {e}")))?
+        .result
+        .frame_tree
+        .frame
+        .id;
+    let responses = page
+        .event_listener::<EventResponseReceived>()
+        .await
+        .map_err(|e| ChaserError::Internal(format!("listen for document responses: {e}")))?;
+    Ok((frame, responses))
+}
+
+#[derive(Debug, Clone)]
+struct DocumentResponse {
+    url: String,
+    loader_id: LoaderId,
+    status: i64,
+    challenged: bool,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessOutcome {
+    Direct,
+    AfterChallenge,
+}
+
+fn document_response(
+    event: &EventResponseReceived,
+    main_frame: &chaser_oxide::cdp::browser_protocol::page::FrameId,
+) -> Option<DocumentResponse> {
+    if event.r#type != ResourceType::Document || event.frame_id.as_ref() != Some(main_frame) {
+        return None;
+    }
+    Some(DocumentResponse {
+        url: event.response.url.clone(),
+        loader_id: event.loader_id.clone(),
+        status: event.response.status,
+        challenged: is_challenge_header(&event.response.headers),
+        observed_at: Instant::now(),
+    })
+}
+
+fn is_challenge_header(headers: &Headers) -> bool {
+    headers.inner().as_object().is_some_and(|headers| {
+        headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cf-mitigated")
+                && value
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("challenge"))
+        })
+    })
+}
+
+fn same_document_url(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(mut a), Ok(mut b)) => {
+            a.set_fragment(None);
+            b.set_fragment(None);
+            a == b
+        }
+        _ => false,
+    }
+}
+
+fn access_result(
+    response: &DocumentResponse,
+    frame_url: &str,
+    frame_loader: &LoaderId,
+    ready_state: &str,
+) -> Option<ChaserResult<()>> {
+    if !same_document_url(frame_url, &response.url) || frame_loader != &response.loader_id {
+        return None;
+    }
+    if response.challenged {
+        return None;
+    }
+    if response.status >= 400 {
+        return Some(Err(ChaserError::NavigationFailed(format!(
+            "HTTP {} at {}",
+            response.status, response.url
+        ))));
+    }
+    if (200..300).contains(&response.status)
+        && response.observed_at.elapsed() >= Duration::from_millis(500)
+        && (ready_state == "interactive" || ready_state == "complete")
+    {
+        return Some(Ok(()));
+    }
+    None
+}
+
+/// Wait for a successful main document. Direct access needs no clearance cookie.
+async fn wait_for_access(
     page: &chaser_oxide::Page,
     chaser: &chaser_oxide::ChaserPage,
-    timeout_seconds: u64,
-) {
+    main_frame: &chaser_oxide::cdp::browser_protocol::page::FrameId,
+    responses: &mut chaser_oxide::listeners::EventStream<EventResponseReceived>,
+    timeout: Duration,
+) -> ChaserResult<AccessOutcome> {
     const PASSIVE_WAIT_MS: u64 = 6_000;
     const CLICK_INTERVAL_MS: u64 = 1_200;
-
-    let started = std::time::Instant::now();
-    let timeout = Duration::from_secs(timeout_seconds);
+    let started = Instant::now();
     let mut last_click = started - Duration::from_secs(30);
+    let mut current_response: Option<DocumentResponse> = None;
+    let mut saw_challenge = false;
 
     loop {
-        if has_clearance_cookie(page).await {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            return;
+        while let Some(Some(event)) = responses.next().now_or_never() {
+            if let Some(response) = document_response(&event, main_frame) {
+                tracing::debug!(url = %response.url, status = response.status, challenged = response.challenged, "main document response");
+                saw_challenge |= response.challenged;
+                current_response = Some(response);
+            }
+        }
+
+        if let Some(response) = current_response.as_ref().filter(|r| !r.challenged) {
+            if let Ok(tree) = page.execute(GetFrameTreeParams::default()).await {
+                let frame = &tree.result.frame_tree.frame;
+                let ready_state = chaser
+                    .evaluate("document.readyState")
+                    .await
+                    .ok()
+                    .and_then(|v| v?.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                if let Some(result) =
+                    access_result(response, &frame.url, &frame.loader_id, &ready_state)
+                {
+                    return result.map(|()| {
+                        if saw_challenge {
+                            AccessOutcome::AfterChallenge
+                        } else {
+                            AccessOutcome::Direct
+                        }
+                    });
+                }
+            }
         }
 
         if started.elapsed() >= timeout {
-            return;
+            return Err(ChaserError::Timeout(timeout.as_millis() as u64));
         }
 
-        // Only start DOM inspection / clicking after the passive window.
-        if started.elapsed().as_millis() as u64 >= PASSIVE_WAIT_MS
+        // Let a challenge run its passive checks before inspecting its DOM.
+        if current_response.as_ref().is_some_and(|r| r.challenged)
+            && started.elapsed().as_millis() as u64 >= PASSIVE_WAIT_MS
             && last_click.elapsed().as_millis() as u64 >= CLICK_INTERVAL_MS
             && try_click_challenge(chaser).await
         {
-            last_click = std::time::Instant::now();
+            last_click = Instant::now();
         }
 
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-}
-
-/// Return true if the browser has a `cf_clearance` cookie for any domain.
-async fn has_clearance_cookie(page: &chaser_oxide::Page) -> bool {
-    page.get_cookies()
-        .await
-        .map(|cookies| cookies.iter().any(|c| c.name == "cf_clearance"))
-        .unwrap_or(false)
 }
 
 /// Click the Turnstile challenge element by traversing its closed shadow root via CDP.
@@ -660,8 +804,80 @@ async fn wait_for_turnstile_token(
 
 #[cfg(test)]
 mod tests {
-    use super::find_challenge_target;
+    use super::{access_result, find_challenge_target, is_challenge_header, DocumentResponse};
     use chaser_oxide::cdp::browser_protocol::dom::{BackendNodeId, Node, NodeId};
+    use chaser_oxide::cdp::browser_protocol::network::{Headers, LoaderId};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn direct_document_succeeds_without_clearance_cookie() {
+        let loader = LoaderId::new("destination");
+        let response = DocumentResponse {
+            url: "https://example.com/path".into(),
+            loader_id: loader.clone(),
+            status: 200,
+            challenged: false,
+            observed_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(matches!(
+            access_result(
+                &response,
+                "https://example.com/path#section",
+                &loader,
+                "complete"
+            ),
+            Some(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn challenge_requires_new_document_even_at_same_url() {
+        let old_loader = LoaderId::new("challenge");
+        let new_loader = LoaderId::new("destination");
+        let mut response = DocumentResponse {
+            url: "https://example.com/path".into(),
+            loader_id: old_loader.clone(),
+            status: 403,
+            challenged: true,
+            observed_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(access_result(&response, &response.url, &old_loader, "complete").is_none());
+        response.status = 200;
+        response.challenged = false;
+        response.loader_id = new_loader.clone();
+        assert!(access_result(&response, &response.url, &old_loader, "complete").is_none());
+        assert!(matches!(
+            access_result(&response, &response.url, &new_loader, "complete"),
+            Some(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn challenge_header_is_case_insensitive() {
+        assert!(is_challenge_header(&Headers::new(
+            serde_json::json!({"Cf-Mitigated": "Challenge"})
+        )));
+        assert!(!is_challenge_header(&Headers::new(
+            serde_json::json!({"cf-mitigated": "other"})
+        )));
+    }
+
+    #[test]
+    fn failed_document_is_an_error() {
+        let loader = LoaderId::new("failure");
+        let response = DocumentResponse {
+            url: "https://example.com/missing".into(),
+            loader_id: loader.clone(),
+            status: 404,
+            challenged: false,
+            observed_at: Instant::now(),
+        };
+        assert!(matches!(
+            access_result(&response, &response.url, &loader, "complete"),
+            Some(Err(crate::error::ChaserError::NavigationFailed(_)))
+        ));
+    }
 
     fn node(id: i64, name: &str, attributes: &[&str]) -> Node {
         Node::builder()

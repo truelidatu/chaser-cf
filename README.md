@@ -9,13 +9,13 @@ Cloudflare bypass library powered by stealth browser automation. No captcha API 
 ## How it works
 
 - Launches a real Chrome instance with a native fingerprint (OS, RAM, UA, Client Hints all consistent)
-- For WAF/managed challenges: polls for `cf_clearance` and clicks the Turnstile checkbox via CDP shadow-root traversal — Cloudflare's widget lives inside a closed shadow root that JS can't reach, but CDP can
+- For WAF/managed challenges: detects Challenge Pages from the main document response, clicks the Turnstile checkbox via CDP shadow-root traversal when needed, and waits for the destination page
 - For Turnstile tokens: injects an extractor script and optionally intercepts the page request to serve a minimal HTML stub, reducing load time and noise
 - Built on [chaser-oxide](https://github.com/ccheshirecat/chaser-oxide), a stealth fork of chromiumoxide
 
 ## Features
 
-- **WAF Session** — extracts `cf_clearance` + `user-agent` for use in subsequent HTTP requests
+- **WAF Session** — returns site cookies and `user-agent` for subsequent HTTP requests; direct access can succeed without `cf_clearance`
 - **Turnstile max** — solves Turnstile with full page load (no site key needed)
 - **Turnstile min** — solves Turnstile with request interception, much faster (site key required)
 - **Page source** — returns HTML after challenge is cleared
@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     // WAF session — returns cookies + user-agent for use in reqwest/ureq/etc.
     let session = chaser.solve_waf_session("https://example.com", None).await?;
-    println!("cf_clearance: {}", session.cookies_string());
+    println!("cookies: {}", session.cookies_string());
     println!("user-agent: {}", session.headers["user-agent"]);
 
     // Page source after challenge cleared
@@ -68,7 +68,8 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 WAF solves use a fresh, disposable browser context by default so cookies and
-storage from earlier calls cannot affect the result. To intentionally reuse
+storage from earlier calls cannot affect the result. A successful direct visit
+may return no `cf_clearance` cookie, or no cookies at all. To intentionally reuse
 the default browser context:
 
 ```rust
